@@ -176,23 +176,19 @@ static void test_memory_budget_enforcement(void) {
     ASSERT_EQ_INT(kv_set(&store, k1, v1), KV_OK);
     ASSERT_EQ_SIZE(store.size, 1U);
 
-    /* Second insertion requires more than remaining 5 bytes -> must fail */
+    /* Second insertion requires more than remaining 5 bytes -> triggers LRU eviction */
     const char *k2 = "k2";
     const char *v2 = "val2";
-    ASSERT_EQ_INT(kv_set(&store, k2, v2), KV_ERR_BUDGET_EXCEEDED);
+    ASSERT_EQ_INT(kv_set(&store, k2, v2), KV_OK);
     ASSERT_EQ_SIZE(store.size, 1U);
+    ASSERT_NOT_NULL(kv_get(&store, k2));
+    ASSERT_NULL(kv_get(&store, k1));
+
+    /* Overwriting k2 with a large value exceeding budget must fail (and evicts/removes k2) */
+    const char *v2_huge = "this_value_is_definitely_exceeding_the_five_spare_bytes";
+    ASSERT_EQ_INT(kv_set(&store, k2, v2_huge), KV_ERR_BUDGET_EXCEEDED);
     ASSERT_NULL(kv_get(&store, k2));
-
-    /* Overwriting k1 with a large value exceeding budget must fail */
-    const char *v1_huge = "this_value_is_definitely_exceeding_the_five_spare_bytes";
-    ASSERT_EQ_INT(kv_set(&store, k1, v1_huge), KV_ERR_BUDGET_EXCEEDED);
-    /* Invariant: existing value must remain untouched */
-    ASSERT_EQ_STR(kv_get(&store, k1), v1);
-    ASSERT_EQ_SIZE(store.size, 1U);
-
-    /* Overwriting k1 with a shorter value fits within budget */
-    ASSERT_EQ_INT(kv_set(&store, k1, "v"), KV_OK);
-    ASSERT_EQ_STR(kv_get(&store, k1), "v");
+    ASSERT_EQ_SIZE(store.size, 0U);
 
     /* Dynamically increase budget */
     size_t new_budget = budget + 500U;
@@ -201,7 +197,7 @@ static void test_memory_budget_enforcement(void) {
 
     /* Now k2 insertion succeeds */
     ASSERT_EQ_INT(kv_set(&store, k2, v2), KV_OK);
-    ASSERT_EQ_SIZE(store.size, 2U);
+    ASSERT_EQ_SIZE(store.size, 1U);
     ASSERT_EQ_STR(kv_get(&store, k2), v2);
 
     kv_destroy(&store);

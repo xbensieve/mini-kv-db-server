@@ -1,11 +1,13 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "kv.h"
+#include "kv_internal.h"
 
 #include <ctype.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 /**
@@ -20,13 +22,13 @@ void kv_set_alloc_fail_countdown(int countdown) {
 /**
  * @brief Testing hook for simulated disk I/O failure (0 = normal, 1 = fail).
  */
-static int g_io_fail = 0;
+int g_io_fail = 0;
 
 void kv_set_io_fail(int fail) {
     g_io_fail = fail;
 }
 
-static void *tracked_malloc(size_t size) {
+void *tracked_malloc(size_t size) {
     if (g_alloc_fail_countdown == 0) {
         g_alloc_fail_countdown = -1;
         return NULL;
@@ -37,7 +39,7 @@ static void *tracked_malloc(size_t size) {
     return malloc(size);
 }
 
-static void *tracked_calloc(size_t num, size_t size) {
+void *tracked_calloc(size_t num, size_t size) {
     if (g_alloc_fail_countdown == 0) {
         g_alloc_fail_countdown = -1;
         return NULL;
@@ -48,14 +50,17 @@ static void *tracked_calloc(size_t num, size_t size) {
     return calloc(num, size);
 }
 
-static void tracked_free(void *ptr) {
+void tracked_free(void *ptr) {
     free(ptr);
 }
 
-/**
- * @brief Measures string length up to max_len + 1 without reading beyond bounds.
- */
-static size_t bounded_strlen(const char *str, size_t max_len) {
+int64_t kv_current_time_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000LL + (int64_t)(ts.tv_nsec / 1000000LL);
+}
+
+size_t bounded_strlen(const char *str, size_t max_len) {
     size_t len = 0U;
     while (len <= max_len && str[len] != '\0') {
         len++;
@@ -63,12 +68,7 @@ static size_t bounded_strlen(const char *str, size_t max_len) {
     return len;
 }
 
-/**
- * @brief Validates a key string against specifications.
- *
- * Keys must be non-NULL, non-empty, <= KV_MAX_KEY_LEN, and contain no ASCII whitespace.
- */
-static int validate_key(const char *key, size_t *out_len) {
+int validate_key(const char *key, size_t *out_len) {
     if (key == NULL) {
         return KV_ERR_INVALID_PARAM;
     }
@@ -90,12 +90,7 @@ static int validate_key(const char *key, size_t *out_len) {
     return KV_OK;
 }
 
-/**
- * @brief Validates a value string against specifications.
- *
- * Values must be non-NULL and <= KV_MAX_VALUE_LEN. Empty string values are permitted.
- */
-static int validate_value(const char *value, size_t *out_len) {
+int validate_value(const char *value, size_t *out_len) {
     if (value == NULL) {
         return KV_ERR_INVALID_PARAM;
     }
@@ -109,10 +104,7 @@ static int validate_value(const char *value, size_t *out_len) {
     return KV_OK;
 }
 
-/**
- * @brief Computes 64-bit FNV-1a hash of a null-terminated key string.
- */
-static size_t hash_key(const char *key, size_t bucket_count) {
+size_t hash_key(const char *key, size_t bucket_count) {
     uint64_t hash = 1469598103934665603ULL;
     for (const unsigned char *p = (const unsigned char *)key; *p != '\0'; ++p) {
         hash ^= (uint64_t)*p;
@@ -121,10 +113,7 @@ static size_t hash_key(const char *key, size_t bucket_count) {
     return (size_t)(hash % (uint64_t)bucket_count);
 }
 
-/**
- * @brief Allocates and copies a string up to max_len bytes with explicit null-termination.
- */
-static char *copy_string_bounded(const char *src, size_t max_len) {
+char *copy_string_bounded(const char *src, size_t max_len) {
     if (src == NULL) {
         return NULL;
     }
@@ -141,9 +130,94 @@ static char *copy_string_bounded(const char *src, size_t max_len) {
     return copy;
 }
 
-/* Forward declarations */
-static int kv_set_internal(kv_store_t *store, const char *key, const char *value);
-static int kv_delete_internal(kv_store_t *store, const char *key);
+int entry_is_expired(const kv_entry_t *entry, int64_t now_ms) {
+    if (entry == NULL) {
+        return 0;
+    }
+    return (entry->expire_at_ms > 0 && entry->expire_at_ms <= now_ms);
+}
+
+void expire_and_delete_unlocked(kv_store_t *store, kv_entry_t *entry, kv_entry_t *prev, size_t index) {
+    if (store == NULL || entry == NULL) {
+        return;
+    }
+    if (prev != NULL) {
+        prev->next = entry->next;
+    } else {
+        store->buckets[index] = entry->next;
+    }
+
+    size_t freed = sizeof(kv_entry_t) + strlen(entry->key) + 1U;
+    if (entry->type == KV_TYPE_STRING) {
+        if (entry->value != NULL) {
+            freed += strlen(entry->value) + 1U;
+            tracked_free(entry->value);
+        }
+    } else if (entry->type == KV_TYPE_LIST) {
+        size_t list_freed = 0;
+        list_destroy(entry->value_ptr, &list_freed);
+        freed += list_freed;
+    } else if (entry->type == KV_TYPE_SET) {
+        size_t set_freed = 0;
+        set_destroy(entry->value_ptr, &set_freed);
+        freed += set_freed;
+    }
+
+    tracked_free(entry->key);
+    tracked_free(entry);
+
+    if (store->size > 0U) {
+        store->size--;
+    }
+    if (store->allocated_bytes >= freed) {
+        store->allocated_bytes -= freed;
+    } else {
+        store->allocated_bytes = 0U;
+    }
+}
+
+kv_entry_t *find_entry_unlocked(const kv_store_t *store, const char *key) {
+    if (store == NULL || store->buckets == NULL || key == NULL) {
+        return NULL;
+    }
+    size_t index = hash_key(key, store->bucket_count);
+    kv_entry_t *prev = NULL;
+    kv_entry_t *entry = store->buckets[index];
+    int64_t now = kv_current_time_ms();
+
+    while (entry != NULL) {
+        if (strcmp(entry->key, key) == 0) {
+            if (entry_is_expired(entry, now)) {
+                expire_and_delete_unlocked((kv_store_t *)store, entry, prev, index);
+                return NULL;
+            }
+            return entry;
+        }
+        prev = entry;
+        entry = entry->next;
+    }
+    return NULL;
+}
+
+void append_aof_rewrite_buffer(kv_store_t *store, const char *data, size_t len) {
+    if (store == NULL || data == NULL || len == 0U || store->aof_rewrite_pid <= 0) {
+        return;
+    }
+    if (store->aof_rewrite_buf == NULL) {
+        store->aof_rewrite_buf_cap = (len > 4096U) ? len * 2U : 4096U;
+        store->aof_rewrite_buf = malloc(store->aof_rewrite_buf_cap);
+        store->aof_rewrite_buf_len = 0U;
+    } else if (store->aof_rewrite_buf_len + len > store->aof_rewrite_buf_cap) {
+        while (store->aof_rewrite_buf_len + len > store->aof_rewrite_buf_cap) {
+            store->aof_rewrite_buf_cap *= 2U;
+        }
+        store->aof_rewrite_buf = realloc(store->aof_rewrite_buf, store->aof_rewrite_buf_cap);
+    }
+    if (store->aof_rewrite_buf != NULL) {
+        memcpy(store->aof_rewrite_buf + store->aof_rewrite_buf_len, data, len);
+        store->aof_rewrite_buf_len += len;
+    }
+}
 
 int kv_init(kv_store_t *store, size_t bucket_count) {
     return kv_init_full(store, bucket_count, KV_DEFAULT_MAX_CAPACITY, KV_DEFAULT_MEMORY_BUDGET, NULL);
@@ -161,103 +235,84 @@ int kv_init_with_aof(kv_store_t *store, size_t bucket_count, const char *aof_pat
     return kv_init_full(store, bucket_count, KV_DEFAULT_MAX_CAPACITY, KV_DEFAULT_MEMORY_BUDGET, aof_path);
 }
 
-/**
- * @brief Strips trailing CR/LF characters from a string.
- */
-static void strip_line_endings(char *line) {
-    size_t len = strlen(line);
-    while (len > 0U && (line[len - 1U] == '\n' || line[len - 1U] == '\r')) {
-        line[--len] = '\0';
-    }
-}
-
-/**
- * @brief Replays mutation records sequentially from an existing AOF log into the store.
- */
-static int replay_aof_log(kv_store_t *store, const char *path) {
-    FILE *rf = fopen(path, "r");
-    if (rf == NULL) {
-        return 0;
-    }
-
-    char line[8192];
-    while (fgets(line, sizeof(line), rf) != NULL) {
-        strip_line_endings(line);
-        if (line[0] == '\0') {
-            continue;
-        }
-
-        if (strncmp(line, "SET\t", 4) == 0 || strncmp(line, "SET ", 4) == 0) {
-            char delim = line[3];
-            char *key_start = line + 4;
-            char *sep = strchr(key_start, delim);
-            if (sep == NULL) {
-                continue; /* Corrupted/missing value separator */
-            }
-            *sep = '\0';
-            const char *key = key_start;
-            const char *val = sep + 1;
-
-            if (validate_key(key, NULL) == KV_OK && validate_value(val, NULL) == KV_OK) {
-                kv_set_internal(store, key, val);
-            }
-        } else if (strncmp(line, "DELETE\t", 7) == 0 || strncmp(line, "DELETE ", 7) == 0) {
-            char delim = line[6];
-            char *key = line + 7;
-            char *sep = strchr(key, delim);
-            if (sep != NULL) {
-                *sep = '\0';
-            }
-            if (validate_key(key, NULL) == KV_OK) {
-                kv_delete_internal(store, key);
-            }
-        }
-    }
-
-    fclose(rf);
-    return 0;
-}
-
 int kv_init_full(kv_store_t *store, size_t bucket_count, size_t max_capacity, size_t max_memory_budget, const char *aof_path) {
     if (store == NULL || bucket_count == 0U) {
         return KV_ERR_INVALID_PARAM;
     }
-    memset(store, 0, sizeof(*store));
 
-    size_t bucket_bytes = bucket_count * sizeof(*store->buckets);
-    if (max_memory_budget > 0U && bucket_bytes > max_memory_budget) {
+    size_t buckets_bytes = bucket_count * sizeof(kv_entry_t *);
+    if (max_memory_budget > 0U && buckets_bytes > max_memory_budget) {
         return KV_ERR_BUDGET_EXCEEDED;
     }
 
-    store->buckets = tracked_calloc(bucket_count, sizeof(*store->buckets));
-    if (store->buckets == NULL) {
+    kv_entry_t **buckets = tracked_calloc(bucket_count, sizeof(kv_entry_t *));
+    if (buckets == NULL) {
         return KV_ERR_INTERNAL;
     }
+
+    store->buckets = buckets;
     store->bucket_count = bucket_count;
     store->size = 0U;
     store->max_capacity = max_capacity;
+    store->allocated_bytes = buckets_bytes;
+    store->peak_allocated_bytes = buckets_bytes;
     store->max_memory_budget = max_memory_budget;
-    store->allocated_bytes = bucket_bytes;
-    store->peak_allocated_bytes = bucket_bytes;
     store->auto_resize = 1;
-    store->durability_level = KV_DURABILITY_SYNC;
+    store->aof_fp = NULL;
+    store->aof_path = NULL;
+    store->durability_level = KV_DURABILITY_FLUSH;
+    store->lru_clock = 0U;
+    store->bgsave_pid = 0;
+    store->aof_rewrite_pid = 0;
+    store->aof_rewrite_buf = NULL;
+    store->aof_rewrite_buf_len = 0U;
+    store->aof_rewrite_buf_cap = 0U;
+
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&store->lock, &attr);
+    pthread_mutexattr_destroy(&attr);
+    store->lock_initialized = 1;
 
     if (aof_path != NULL) {
         size_t path_len = strlen(aof_path);
-        store->aof_path = malloc(path_len + 1U);
+        size_t path_bytes = path_len + 1U;
+
+        if (max_memory_budget > 0U && store->allocated_bytes + path_bytes > max_memory_budget) {
+            pthread_mutex_destroy(&store->lock);
+            store->lock_initialized = 0;
+            tracked_free(store->buckets);
+            store->buckets = NULL;
+            return KV_ERR_BUDGET_EXCEEDED;
+        }
+
+        store->aof_path = tracked_malloc(path_bytes);
         if (store->aof_path == NULL) {
-            kv_destroy(store);
+            pthread_mutex_destroy(&store->lock);
+            store->lock_initialized = 0;
+            tracked_free(store->buckets);
+            store->buckets = NULL;
             return KV_ERR_INTERNAL;
         }
-        memcpy(store->aof_path, aof_path, path_len + 1U);
+        memcpy(store->aof_path, aof_path, path_len);
+        store->aof_path[path_len] = '\0';
+        store->allocated_bytes += path_bytes;
+        if (store->allocated_bytes > store->peak_allocated_bytes) {
+            store->peak_allocated_bytes = store->allocated_bytes;
+        }
 
-        /* Replay existing log if file exists */
+        /* Replay existing log */
         replay_aof_log(store, aof_path);
 
-        /* Open in append mode for future mutations */
         store->aof_fp = fopen(aof_path, "a+");
         if (store->aof_fp == NULL) {
-            kv_destroy(store);
+            pthread_mutex_destroy(&store->lock);
+            store->lock_initialized = 0;
+            tracked_free(store->aof_path);
+            store->aof_path = NULL;
+            tracked_free(store->buckets);
+            store->buckets = NULL;
             return KV_ERR_IO;
         }
     }
@@ -266,34 +321,33 @@ int kv_init_full(kv_store_t *store, size_t bucket_count, size_t max_capacity, si
 }
 
 int kv_resize(kv_store_t *store, size_t new_bucket_count) {
-    if (store == NULL || store->buckets == NULL || new_bucket_count == 0U) {
+    if (store == NULL || new_bucket_count == 0U) {
         return KV_ERR_INVALID_PARAM;
     }
-    if (new_bucket_count == store->bucket_count) {
-        return KV_OK;
+
+    pthread_mutex_lock(&store->lock);
+
+    size_t new_buckets_bytes = new_bucket_count * sizeof(kv_entry_t *);
+    size_t old_buckets_bytes = store->bucket_count * sizeof(kv_entry_t *);
+
+    if (store->max_memory_budget > 0U) {
+        if (store->allocated_bytes + new_buckets_bytes > store->max_memory_budget) {
+            pthread_mutex_unlock(&store->lock);
+            return KV_ERR_BUDGET_EXCEEDED;
+        }
     }
 
-    size_t new_bucket_bytes = new_bucket_count * sizeof(kv_entry_t *);
-    size_t old_bucket_bytes = store->bucket_count * sizeof(kv_entry_t *);
-
-    /* Check memory budget for the temporary coexistence of both arrays */
-    if (store->max_memory_budget > 0U && store->allocated_bytes + new_bucket_bytes > store->max_memory_budget) {
-        return KV_ERR_BUDGET_EXCEEDED;
-    }
-
-    /* Allocate new bucket array */
-    kv_entry_t **new_buckets = tracked_calloc(new_bucket_count, sizeof(*new_buckets));
+    kv_entry_t **new_buckets = tracked_calloc(new_bucket_count, sizeof(kv_entry_t *));
     if (new_buckets == NULL) {
+        pthread_mutex_unlock(&store->lock);
         return KV_ERR_INTERNAL;
     }
 
-    /* Record temporary memory spike while both arrays co-exist */
-    store->allocated_bytes += new_bucket_bytes;
+    store->allocated_bytes += new_buckets_bytes;
     if (store->allocated_bytes > store->peak_allocated_bytes) {
         store->peak_allocated_bytes = store->allocated_bytes;
     }
 
-    /* Migrate all existing entries into new bucket array */
     for (size_t i = 0U; i < store->bucket_count; ++i) {
         kv_entry_t *entry = store->buckets[i];
         while (entry != NULL) {
@@ -305,246 +359,232 @@ int kv_resize(kv_store_t *store, size_t new_bucket_count) {
         }
     }
 
-    /* Release old bucket array and adjust memory tracking */
     tracked_free(store->buckets);
     store->buckets = new_buckets;
     store->bucket_count = new_bucket_count;
-    store->allocated_bytes -= old_bucket_bytes;
+    store->allocated_bytes -= old_buckets_bytes;
 
+    pthread_mutex_unlock(&store->lock);
     return KV_OK;
 }
 
 void kv_set_auto_resize(kv_store_t *store, int enabled) {
     if (store != NULL) {
+        pthread_mutex_lock(&store->lock);
         store->auto_resize = enabled ? 1 : 0;
+        pthread_mutex_unlock(&store->lock);
     }
 }
 
 size_t kv_bucket_count(const kv_store_t *store) {
-    return (store != NULL) ? store->bucket_count : 0U;
+    if (store == NULL) return 0U;
+    return store->bucket_count;
 }
 
 void kv_set_max_capacity(kv_store_t *store, size_t max_capacity) {
     if (store != NULL) {
+        pthread_mutex_lock(&store->lock);
         store->max_capacity = max_capacity;
+        pthread_mutex_unlock(&store->lock);
     }
 }
 
 void kv_set_memory_budget(kv_store_t *store, size_t budget_bytes) {
     if (store != NULL) {
+        pthread_mutex_lock(&store->lock);
         store->max_memory_budget = budget_bytes;
+        pthread_mutex_unlock(&store->lock);
     }
-}
-
-void kv_set_durability(kv_store_t *store, int level) {
-    if (store != NULL) {
-        store->durability_level = level;
-    }
-}
-
-int kv_sync(kv_store_t *store) {
-    if (store == NULL || store->aof_fp == NULL) {
-        return KV_OK;
-    }
-    if (fflush(store->aof_fp) != 0) {
-        return KV_ERR_IO;
-    }
-    int fd = fileno(store->aof_fp);
-    if (fd >= 0 && fsync(fd) != 0) {
-        return KV_ERR_IO;
-    }
-    return KV_OK;
-}
-
-const char *kv_aof_path(const kv_store_t *store) {
-    return (store != NULL) ? store->aof_path : NULL;
 }
 
 size_t kv_allocated_bytes(const kv_store_t *store) {
-    return (store != NULL) ? store->allocated_bytes : 0U;
+    if (store == NULL) return 0U;
+    return store->allocated_bytes;
 }
 
 size_t kv_peak_allocated_bytes(const kv_store_t *store) {
-    return (store != NULL) ? store->peak_allocated_bytes : 0U;
+    if (store == NULL) return 0U;
+    return store->peak_allocated_bytes;
 }
 
 size_t kv_max_memory_budget(const kv_store_t *store) {
-    return (store != NULL) ? store->max_memory_budget : 0U;
+    if (store == NULL) return 0U;
+    return store->max_memory_budget;
 }
 
 void kv_destroy(kv_store_t *store) {
-    if (store == NULL) {
+    if (store == NULL || store->buckets == NULL) {
         return;
     }
+
+    if (store->lock_initialized) {
+        pthread_mutex_lock(&store->lock);
+    }
+
+    for (size_t i = 0U; i < store->bucket_count; ++i) {
+        kv_entry_t *entry = store->buckets[i];
+        while (entry != NULL) {
+            kv_entry_t *next = entry->next;
+            if (entry->type == KV_TYPE_STRING) {
+                tracked_free(entry->value);
+            } else if (entry->type == KV_TYPE_LIST) {
+                list_destroy(entry->value_ptr, NULL);
+            } else if (entry->type == KV_TYPE_SET) {
+                set_destroy(entry->value_ptr, NULL);
+            }
+            tracked_free(entry->key);
+            tracked_free(entry);
+            entry = next;
+        }
+    }
+
+    tracked_free(store->buckets);
+    store->buckets = NULL;
+
     if (store->aof_fp != NULL) {
-        fflush(store->aof_fp);
         fclose(store->aof_fp);
         store->aof_fp = NULL;
     }
     if (store->aof_path != NULL) {
-        free(store->aof_path);
+        tracked_free(store->aof_path);
         store->aof_path = NULL;
     }
-    if (store->buckets != NULL) {
-        for (size_t i = 0U; i < store->bucket_count; ++i) {
-            kv_entry_t *entry = store->buckets[i];
-            while (entry != NULL) {
-                kv_entry_t *next = entry->next;
-                tracked_free(entry->key);
-                tracked_free(entry->value);
-                tracked_free(entry);
-                entry = next;
-            }
-        }
-        tracked_free(store->buckets);
-        store->buckets = NULL;
+    if (store->aof_rewrite_buf != NULL) {
+        free(store->aof_rewrite_buf);
+        store->aof_rewrite_buf = NULL;
+        store->aof_rewrite_buf_len = 0U;
+        store->aof_rewrite_buf_cap = 0U;
     }
+
     store->bucket_count = 0U;
     store->size = 0U;
-    store->max_capacity = 0U;
     store->allocated_bytes = 0U;
     store->peak_allocated_bytes = 0U;
-    store->max_memory_budget = 0U;
-    store->auto_resize = 0;
-    store->durability_level = 0;
-}
 
-/**
- * @brief Appends a formatted mutation record to the open AOF file.
- */
-static int write_aof_record(kv_store_t *store, const char *format, const char *arg1, const char *arg2, long *out_pos) {
-    if (store->aof_fp == NULL) {
-        return KV_OK;
-    }
-    if (g_io_fail) {
-        return KV_ERR_IO;
-    }
-
-    long pos = ftell(store->aof_fp);
-    if (pos < 0) {
-        return KV_ERR_IO;
-    }
-    if (out_pos != NULL) {
-        *out_pos = pos;
-    }
-
-    int ret = 0;
-    if (arg2 != NULL) {
-        ret = fprintf(store->aof_fp, format, arg1, arg2);
-    } else {
-        ret = fprintf(store->aof_fp, format, arg1);
-    }
-    if (ret < 0) {
-        return KV_ERR_IO;
-    }
-
-    if (store->durability_level >= KV_DURABILITY_FLUSH) {
-        if (fflush(store->aof_fp) != 0) {
-            return KV_ERR_IO;
-        }
-    }
-
-    if (store->durability_level >= KV_DURABILITY_SYNC) {
-        int fd = fileno(store->aof_fp);
-        if (fd >= 0 && fsync(fd) != 0) {
-            return KV_ERR_IO;
-        }
-    }
-
-    return KV_OK;
-}
-
-/**
- * @brief Rolls back AOF file offset and truncates written bytes on mutation failure.
- */
-static void rollback_aof_record(kv_store_t *store, long pos) {
-    if (store->aof_fp != NULL && pos >= 0) {
-        fflush(store->aof_fp);
-        int fd = fileno(store->aof_fp);
-        if (fd >= 0) {
-            ftruncate(fd, (off_t)pos);
-        }
-        fseek(store->aof_fp, pos, SEEK_SET);
+    if (store->lock_initialized) {
+        pthread_mutex_unlock(&store->lock);
+        pthread_mutex_destroy(&store->lock);
+        store->lock_initialized = 0;
     }
 }
 
-/**
- * @brief Applies in-memory SET without writing to AOF (used by kv_set and AOF replay).
- */
-static int kv_set_internal(kv_store_t *store, const char *key, const char *value) {
-    size_t key_len = strlen(key);
-    size_t val_len = strlen(value);
+int kv_set_internal(kv_store_t *store, const char *key, const char *value) {
+    size_t key_len = 0U;
+    size_t val_len = 0U;
+    int k_err = validate_key(key, &key_len);
+    if (k_err != KV_OK) return k_err;
+    int v_err = validate_value(value, &val_len);
+    if (v_err != KV_OK) return v_err;
+
+    /* Check if key already exists */
     size_t index = hash_key(key, store->bucket_count);
+    kv_entry_t *existing = NULL;
+    for (kv_entry_t *e = store->buckets[index]; e != NULL; e = e->next) {
+        if (strcmp(e->key, key) == 0) {
+            existing = e;
+            break;
+        }
+    }
 
-    /* Look for existing key in bucket chain */
-    for (kv_entry_t *entry = store->buckets[index]; entry != NULL; entry = entry->next) {
-        if (strcmp(entry->key, key) == 0) {
-            size_t old_val_bytes = strlen(entry->value) + 1U;
-            size_t new_val_bytes = val_len + 1U;
+    if (existing != NULL) {
+        if (existing->type != KV_TYPE_STRING) {
+            return KV_ERR_WRONG_TYPE;
+        }
+        size_t old_val_bytes = strlen(existing->value) + 1U;
+        size_t new_val_bytes = val_len + 1U;
+        size_t delta = (new_val_bytes > old_val_bytes) ? (new_val_bytes - old_val_bytes) : 0U;
 
-            if (new_val_bytes > old_val_bytes && store->max_memory_budget > 0U) {
-                size_t delta = new_val_bytes - old_val_bytes;
-                if (store->allocated_bytes + delta > store->max_memory_budget) {
-                    return KV_ERR_BUDGET_EXCEEDED;
+        if (store->max_memory_budget > 0U && delta > 0U) {
+            while (store->allocated_bytes + delta > store->max_memory_budget && store->size > 0U) {
+                if (kv_evict_lru_unlocked(store) != KV_OK) {
+                    break;
                 }
             }
+            if (store->allocated_bytes + delta > store->max_memory_budget) {
+                return KV_ERR_BUDGET_EXCEEDED;
+            }
+        }
 
+        /* Check if existing entry was evicted while evicting for budget */
+        existing = NULL;
+        index = hash_key(key, store->bucket_count);
+        for (kv_entry_t *e = store->buckets[index]; e != NULL; e = e->next) {
+            if (strcmp(e->key, key) == 0) {
+                existing = e;
+                break;
+            }
+        }
+        if (existing != NULL) {
             char *new_value = copy_string_bounded(value, KV_MAX_VALUE_LEN);
             if (new_value == NULL) {
                 return KV_ERR_INTERNAL;
             }
+            tracked_free(existing->value);
+            existing->value = new_value;
+            existing->last_accessed_time = ++store->lru_clock;
 
-            tracked_free(entry->value);
-            entry->value = new_value;
-
-            store->allocated_bytes = store->allocated_bytes - old_val_bytes + new_val_bytes;
-            if (store->allocated_bytes > store->peak_allocated_bytes) {
-                store->peak_allocated_bytes = store->allocated_bytes;
+            if (new_val_bytes > old_val_bytes) {
+                store->allocated_bytes += (new_val_bytes - old_val_bytes);
+                if (store->allocated_bytes > store->peak_allocated_bytes) {
+                    store->peak_allocated_bytes = store->allocated_bytes;
+                }
+            } else {
+                store->allocated_bytes -= (old_val_bytes - new_val_bytes);
             }
+
+            append_aof_rewrite_buffer(store, "SET\t", 4);
+            append_aof_rewrite_buffer(store, key, key_len);
+            append_aof_rewrite_buffer(store, "\t", 1);
+            append_aof_rewrite_buffer(store, value, val_len);
+            append_aof_rewrite_buffer(store, "\n", 1);
+
             return KV_OK;
         }
     }
 
-    /* Key is new: enforce capacity limits */
+    /* New entry insertion */
     if (store->max_capacity > 0U && store->size >= store->max_capacity) {
         return KV_ERR_CAPACITY_FULL;
     }
 
-    /* Check load factor and trigger auto-resizing if threshold (0.75) is exceeded */
-    if (store->auto_resize && (store->size + 1U) * KV_LOAD_FACTOR_DEN > store->bucket_count * KV_LOAD_FACTOR_NUM) {
-        size_t new_count = store->bucket_count * 2U;
-        if (new_count > store->bucket_count) {
-            int resize_res = kv_resize(store, new_count);
-            if (resize_res == KV_OK) {
-                index = hash_key(key, store->bucket_count);
+    size_t entry_bytes = sizeof(kv_entry_t) + key_len + 1U + val_len + 1U;
+    if (store->max_memory_budget > 0U) {
+        while (store->allocated_bytes + entry_bytes > store->max_memory_budget && store->size > 0U) {
+            if (kv_evict_lru_unlocked(store) != KV_OK) {
+                break;
             }
+        }
+        if (store->allocated_bytes + entry_bytes > store->max_memory_budget) {
+            return KV_ERR_BUDGET_EXCEEDED;
         }
     }
 
-    /* Check memory budget for new entry */
-    size_t entry_bytes = sizeof(kv_entry_t) + (key_len + 1U) + (val_len + 1U);
-    if (store->max_memory_budget > 0U && store->allocated_bytes + entry_bytes > store->max_memory_budget) {
-        return KV_ERR_BUDGET_EXCEEDED;
+    /* Check auto resize */
+    if (store->auto_resize && ((store->size + 1U) * KV_LOAD_FACTOR_DEN >= store->bucket_count * KV_LOAD_FACTOR_NUM)) {
+        kv_resize(store, store->bucket_count * 2U);
+        index = hash_key(key, store->bucket_count);
     }
 
-    kv_entry_t *entry = tracked_calloc(1U, sizeof(*entry));
+    kv_entry_t *entry = tracked_malloc(sizeof(kv_entry_t));
     if (entry == NULL) {
         return KV_ERR_INTERNAL;
     }
-
     entry->key = copy_string_bounded(key, KV_MAX_KEY_LEN);
     if (entry->key == NULL) {
         tracked_free(entry);
         return KV_ERR_INTERNAL;
     }
-
     entry->value = copy_string_bounded(value, KV_MAX_VALUE_LEN);
     if (entry->value == NULL) {
         tracked_free(entry->key);
         tracked_free(entry);
         return KV_ERR_INTERNAL;
     }
+    entry->type = KV_TYPE_STRING;
+    entry->expire_at_ms = 0;
+    entry->last_accessed_time = ++store->lru_clock;
 
+    index = hash_key(key, store->bucket_count);
     entry->next = store->buckets[index];
     store->buckets[index] = entry;
     store->size++;
@@ -552,119 +592,134 @@ static int kv_set_internal(kv_store_t *store, const char *key, const char *value
     if (store->allocated_bytes > store->peak_allocated_bytes) {
         store->peak_allocated_bytes = store->allocated_bytes;
     }
+
+    append_aof_rewrite_buffer(store, "SET\t", 4);
+    append_aof_rewrite_buffer(store, key, key_len);
+    append_aof_rewrite_buffer(store, "\t", 1);
+    append_aof_rewrite_buffer(store, value, val_len);
+    append_aof_rewrite_buffer(store, "\n", 1);
+
     return KV_OK;
 }
 
 int kv_set(kv_store_t *store, const char *key, const char *value) {
-    if (store == NULL || store->buckets == NULL) {
+    if (store == NULL || !store->lock_initialized) {
         return KV_ERR_INVALID_PARAM;
     }
 
-    size_t key_len = 0U;
-    int key_err = validate_key(key, &key_len);
-    if (key_err != KV_OK) {
-        return key_err;
+    pthread_mutex_lock(&store->lock);
+
+    int err = validate_key(key, NULL);
+    if (err != KV_OK) {
+        pthread_mutex_unlock(&store->lock);
+        return err;
+    }
+    err = validate_value(value, NULL);
+    if (err != KV_OK) {
+        pthread_mutex_unlock(&store->lock);
+        return err;
     }
 
-    size_t val_len = 0U;
-    int val_err = validate_value(value, &val_len);
-    if (val_err != KV_OK) {
-        return val_err;
-    }
-
-    /* Step 1: Write mutation to AOF before modifying memory */
-    long pos = -1;
+    long aof_pos = -1;
     if (store->aof_fp != NULL) {
-        int io_err = write_aof_record(store, "SET\t%s\t%s\n", key, value, &pos);
-        if (io_err != KV_OK) {
-            if (pos >= 0) {
-                rollback_aof_record(store, pos);
-            }
-            return io_err;
+        int aof_err = write_aof_record(store, "SET\t%s\t%s\n", key, value, &aof_pos);
+        if (aof_err != KV_OK) {
+            pthread_mutex_unlock(&store->lock);
+            return aof_err;
         }
     }
 
-    /* Step 2: Apply in-memory mutation */
-    int mem_res = kv_set_internal(store, key, value);
-    if (mem_res != KV_OK) {
-        /* Roll back disk write if in-memory update failed */
-        if (store->aof_fp != NULL && pos >= 0) {
-            rollback_aof_record(store, pos);
-        }
-        return mem_res;
+    int res = kv_set_internal(store, key, value);
+    if (res != KV_OK && store->aof_fp != NULL) {
+        rollback_aof_record(store, aof_pos);
     }
 
-    return KV_OK;
+    pthread_mutex_unlock(&store->lock);
+    return res;
 }
 
 const char *kv_get(const kv_store_t *store, const char *key) {
-    if (store == NULL || store->buckets == NULL) {
+    if (store == NULL || !store->lock_initialized) {
         return NULL;
     }
-    if (validate_key(key, NULL) != KV_OK) {
+    pthread_mutex_lock((pthread_mutex_t *)&store->lock);
+    kv_entry_t *entry = find_entry_unlocked(store, key);
+    if (entry == NULL) {
+        pthread_mutex_unlock((pthread_mutex_t *)&store->lock);
         return NULL;
     }
-
-    size_t index = hash_key(key, store->bucket_count);
-    for (const kv_entry_t *entry = store->buckets[index]; entry != NULL; entry = entry->next) {
-        if (strcmp(entry->key, key) == 0) {
-            return entry->value;
-        }
+    if (entry->type != KV_TYPE_STRING) {
+        pthread_mutex_unlock((pthread_mutex_t *)&store->lock);
+        return NULL;
     }
-    return NULL;
+    entry->last_accessed_time = ++((kv_store_t *)store)->lru_clock;
+    const char *val = entry->value;
+    pthread_mutex_unlock((pthread_mutex_t *)&store->lock);
+    return val;
 }
 
-/**
- * @brief Applies in-memory DELETE without writing to AOF (used by kv_delete and AOF replay).
- */
-static int kv_delete_internal(kv_store_t *store, const char *key) {
+int kv_delete_internal(kv_store_t *store, const char *key) {
+    int err = validate_key(key, NULL);
+    if (err != KV_OK) {
+        return KV_ERR_INVALID_PARAM;
+    }
+
     size_t index = hash_key(key, store->bucket_count);
     kv_entry_t **cursor = &store->buckets[index];
+    kv_entry_t *prev = NULL;
+
     while (*cursor != NULL) {
         kv_entry_t *entry = *cursor;
         if (strcmp(entry->key, key) == 0) {
-            *cursor = entry->next;
-            size_t entry_bytes = sizeof(kv_entry_t) + strlen(entry->key) + 1U + strlen(entry->value) + 1U;
-            tracked_free(entry->key);
-            tracked_free(entry->value);
-            tracked_free(entry);
-            store->size--;
-            store->allocated_bytes -= entry_bytes;
+            expire_and_delete_unlocked(store, entry, prev, index);
+
+            append_aof_rewrite_buffer(store, "DELETE\t", 7);
+            append_aof_rewrite_buffer(store, key, strlen(key));
+            append_aof_rewrite_buffer(store, "\n", 1);
+
             return KV_OK;
         }
+        prev = entry;
         cursor = &entry->next;
     }
     return KV_ERR_NOT_FOUND;
 }
 
 int kv_delete(kv_store_t *store, const char *key) {
-    if (store == NULL || store->buckets == NULL) {
+    if (store == NULL || !store->lock_initialized) {
         return KV_ERR_INVALID_PARAM;
     }
-    if (validate_key(key, NULL) != KV_OK) {
+    pthread_mutex_lock(&store->lock);
+    int err = validate_key(key, NULL);
+    if (err != KV_OK) {
+        pthread_mutex_unlock(&store->lock);
         return KV_ERR_INVALID_PARAM;
     }
 
-    /* Check if key exists; no disk write if not found */
-    if (!kv_exists(store, key)) {
-        return KV_ERR_NOT_FOUND;
-    }
-
-    /* Write DELETE to AOF before modifying memory */
-    long pos = -1;
+    long aof_pos = -1;
     if (store->aof_fp != NULL) {
-        int io_err = write_aof_record(store, "DELETE\t%s\n", key, NULL, &pos);
-        if (io_err != KV_OK) {
-            if (pos >= 0) {
-                rollback_aof_record(store, pos);
-            }
-            return io_err;
+        int aof_err = write_aof_record(store, "DELETE\t%s\n", key, NULL, &aof_pos);
+        if (aof_err != KV_OK) {
+            pthread_mutex_unlock(&store->lock);
+            return aof_err;
         }
     }
 
-    return kv_delete_internal(store, key);
+    int res = kv_delete_internal(store, key);
+    if (res != KV_OK && store->aof_fp != NULL) {
+        rollback_aof_record(store, aof_pos);
+    }
+
+    pthread_mutex_unlock(&store->lock);
+    return res;
 }
 
 int kv_exists(const kv_store_t *store, const char *key) {
-    return kv_get(store, key) != NULL ? 1 : 0;
+    if (store == NULL || !store->lock_initialized) {
+        return 0;
+    }
+    pthread_mutex_lock((pthread_mutex_t *)&store->lock);
+    int exists = (find_entry_unlocked(store, key) != NULL);
+    pthread_mutex_unlock((pthread_mutex_t *)&store->lock);
+    return exists;
 }
