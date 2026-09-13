@@ -316,6 +316,7 @@ static void test_concurrent_ttl_hammer(void) {
 }
 
 int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);
     printf("Running TTL & Eviction Tests...\n");
     
     RUN_TEST(test_ttl_passive_expiration);

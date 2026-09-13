@@ -26,12 +26,16 @@ kv_entry_t *find_entry_unlocked(const kv_store_t *store, const char *key);
 int kv_set_internal(kv_store_t *store, const char *key, const char *value);
 int kv_delete_internal(kv_store_t *store, const char *key);
 int kv_evict_lru_unlocked(kv_store_t *store);
+int kv_resize_unlocked(kv_store_t *store, size_t new_bucket_count);
 
 void append_aof_rewrite_buffer(kv_store_t *store, const char *data, size_t len);
 int write_aof_record(kv_store_t *store, const char *format, const char *arg1, const char *arg2, long *out_pos);
 int write_aof_pexpireat(kv_store_t *store, const char *key, int64_t expire_ms, long *out_pos);
 void rollback_aof_record(kv_store_t *store, long pos);
 int replay_aof_log(kv_store_t *store, const char *path);
+
+size_t kv_lock_index(const kv_store_t *store, const char *key);
+void kv_discard_aof_rewrite(kv_store_t *store);
 
 void expire_and_delete_unlocked(kv_store_t *store, kv_entry_t *entry, kv_entry_t *prev, size_t index);
 

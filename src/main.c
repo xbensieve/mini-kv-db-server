@@ -2,6 +2,7 @@
 
 #include "kv.h"
 #include "server.h"
+#include "replication.h"
 
 #include <signal.h>
 #include <stdio.h>
@@ -17,7 +18,7 @@ static void handle_signal(int sig) {
 
 static int run_cli(kv_store_t *store) {
     char line[4096];
-    puts("Mini KV Phase 01 starter. Commands: SET key value | GET key | DELETE key | EXISTS key | QUIT");
+    puts("Mini KV starter. Commands: SET key value | GET key | DELETE key | EXISTS key | QUIT");
 
     while (fgets(line, sizeof(line), stdin) != NULL) {
         line[strcspn(line, "\n")] = '\0';
@@ -62,6 +63,8 @@ int main(int argc, char *argv[]) {
     uint16_t port = (uint16_t)SERVER_DEFAULT_PORT;
     const char *data_path = NULL;
     int cli_mode = 0;
+    const char *replica_host = NULL;
+    uint16_t replica_port = 0;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
@@ -74,6 +77,9 @@ int main(int argc, char *argv[]) {
             }
         } else if (strcmp(argv[i], "--data") == 0 && i + 1 < argc) {
             data_path = argv[++i];
+        } else if (strcmp(argv[i], "--replicaof") == 0 && i + 2 < argc) {
+            replica_host = argv[++i];
+            replica_port = (uint16_t)atoi(argv[++i]);
         } else if (strcmp(argv[i], "--cli") == 0) {
             cli_mode = 1;
         }
@@ -93,8 +99,12 @@ int main(int argc, char *argv[]) {
         return ret;
     }
 
+    replication_init(&g_replication_state, &store, replica_host, replica_port);
+    replication_start(&g_replication_state);
+
     if (server_init(&g_server, &store, port) != 0) {
         fprintf(stderr, "failed to bind server to port %u\n", (unsigned int)port);
+        replication_stop(&g_replication_state);
         kv_destroy(&store);
         return 1;
     }
@@ -106,11 +116,16 @@ int main(int argc, char *argv[]) {
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
-    printf("Mini Key-Value Database Server running on port %u\n", (unsigned int)server_get_port(&g_server));
+    if (replica_host) {
+        printf("Mini Key-Value Database Server running on port %u (Replica of %s:%u)\n", (unsigned int)server_get_port(&g_server), replica_host, replica_port);
+    } else {
+        printf("Mini Key-Value Database Server running on port %u (Master)\n", (unsigned int)server_get_port(&g_server));
+    }
     server_run(&g_server);
 
     printf("Shutting down server gracefully...\n");
     server_destroy(&g_server);
+    replication_stop(&g_replication_state);
     kv_destroy(&store);
 
     return 0;

@@ -110,24 +110,28 @@ typedef struct kv_entry {
     struct kv_entry *next;        /**< Pointer to next entry in collision chain. */
 } kv_entry_t;
 
+#include <stdatomic.h>
+
 /**
- * @brief Hash table key-value store with concurrency, accounting, and persistence.
+ * @brief Hash table key-value store with granular lock sharding, accounting, and persistence.
  */
 typedef struct kv_store {
     kv_entry_t **buckets;        /**< Dynamic array of bucket head pointers (OWN by store). */
-    size_t bucket_count;         /**< Total number of allocated buckets. */
-    size_t size;                 /**< Current count of active key-value entries. */
-    size_t max_capacity;         /**< Entry count capacity limit (0 = unbounded). */
-    size_t allocated_bytes;      /**< Total heap bytes currently owned by the store. */
-    size_t peak_allocated_bytes; /**< Maximum allocated_bytes observed over store lifecycle. */
-    size_t max_memory_budget;    /**< Maximum memory budget in bytes (0 = unbounded). */
-    int auto_resize;             /**< 1 = auto-resize enabled on load factor threshold; 0 = disabled. */
+    _Atomic size_t bucket_count;         /**< Total number of allocated buckets. */
+    _Atomic size_t size;                 /**< Current count of active key-value entries. */
+    _Atomic size_t max_capacity;         /**< Entry count capacity limit (0 = unbounded). */
+    _Atomic size_t allocated_bytes;      /**< Total heap bytes currently owned by the store. */
+    _Atomic size_t peak_allocated_bytes; /**< Maximum allocated_bytes observed over store lifecycle. */
+    _Atomic size_t max_memory_budget;    /**< Maximum memory budget in bytes (0 = unbounded). */
+    _Atomic int auto_resize;             /**< 1 = auto-resize enabled on load factor threshold; 0 = disabled. */
     FILE *aof_fp;                /**< Open AOF file stream (or NULL if in-memory only). */
     char *aof_path;              /**< Heap copy of AOF file path (OWN by store, or NULL). */
     int durability_level;        /**< Durability policy: KV_DURABILITY_*. */
-    pthread_mutex_t lock;        /**< Recursive mutex protecting store mutations and queries. */
-    int lock_initialized;        /**< 1 if lock was initialized. */
-    uint64_t lru_clock;          /**< Monotonic access sequence for LRU. */
+    pthread_mutex_t *bucket_locks; /**< Sharded recursive mutex array protecting buckets and entries. */
+    size_t num_locks;             /**< Total number of bucket lock shards. */
+    pthread_mutex_t aof_lock;     /**< Mutex protecting AOF file writes and rewrite mutation buffer. */
+    int lock_initialized;        /**< 1 if bucket and AOF locks were initialized. */
+    _Atomic uint64_t lru_clock;  /**< Monotonic access sequence for LRU. */
     pid_t bgsave_pid;            /**< Active BGSAVE child process PID (0 if none). */
     pid_t aof_rewrite_pid;       /**< Active BGREWRITEAOF child process PID (0 if none). */
     char *aof_rewrite_buf;       /**< Buffer accumulating mutations during BGREWRITEAOF. */
@@ -254,6 +258,41 @@ void kv_set_alloc_fail_countdown(int countdown);
  * @brief Testing hook: configures simulated disk I/O failure.
  */
 void kv_set_io_fail(int fail);
+
+/**
+ * @brief Acquires the specific bucket shard lock corresponding to the given key.
+ *
+ * Maps key hash modulo num_locks to a specific recursive mutex in bucket_locks.
+ *
+ * @param store Pointer to key-value store.
+ * @param key Key string used to determine the lock shard via modulo hash.
+ */
+void kv_acquire_bucket_lock(kv_store_t *store, const char *key);
+
+/**
+ * @brief Releases the specific bucket shard lock corresponding to the given key.
+ *
+ * @param store Pointer to key-value store.
+ * @param key Key string used to determine the lock shard via modulo hash.
+ */
+void kv_release_bucket_lock(kv_store_t *store, const char *key);
+
+/**
+ * @brief Sequentially acquires all bucket shard locks in strict index order (0 to num_locks - 1).
+ *
+ * Used for global operations (resizing, snapshots, AOF compaction, full sweeps) to ensure
+ * total point-in-time state consistency and prevent deadlocks.
+ *
+ * @param store Pointer to key-value store.
+ */
+void kv_acquire_all_locks(kv_store_t *store);
+
+/**
+ * @brief Sequentially releases all bucket shard locks in strict index order.
+ *
+ * @param store Pointer to key-value store.
+ */
+void kv_release_all_locks(kv_store_t *store);
 
 /* Modular header inclusions */
 #include "list.h"

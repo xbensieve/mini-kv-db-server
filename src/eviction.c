@@ -40,11 +40,11 @@ int kv_pexpireat(kv_store_t *store, const char *key, int64_t unix_ms) {
         return KV_ERR_INVALID_PARAM;
     }
 
-    pthread_mutex_lock(&store->lock);
+    kv_acquire_bucket_lock(store, key);
 
     kv_entry_t *entry = find_entry_unlocked(store, key);
     if (entry == NULL) {
-        pthread_mutex_unlock(&store->lock);
+        kv_release_bucket_lock(store, key);
         return 0;
     }
 
@@ -61,7 +61,7 @@ int kv_pexpireat(kv_store_t *store, const char *key, int64_t unix_ms) {
     append_aof_rewrite_buffer(store, buf, strlen(buf));
     append_aof_rewrite_buffer(store, "\n", 1);
 
-    pthread_mutex_unlock(&store->lock);
+    kv_release_bucket_lock(store, key);
     return 1;
 }
 
@@ -78,21 +78,21 @@ int64_t kv_pttl(kv_store_t *store, const char *key) {
         return -2;
     }
 
-    pthread_mutex_lock(&store->lock);
+    kv_acquire_bucket_lock(store, key);
 
     kv_entry_t *entry = find_entry_unlocked(store, key);
     if (entry == NULL) {
-        pthread_mutex_unlock(&store->lock);
+        kv_release_bucket_lock(store, key);
         return -2;
     }
 
     if (entry->expire_at_ms == 0) {
-        pthread_mutex_unlock(&store->lock);
+        kv_release_bucket_lock(store, key);
         return -1;
     }
 
     int64_t rem = entry->expire_at_ms - kv_current_time_ms();
-    pthread_mutex_unlock(&store->lock);
+    kv_release_bucket_lock(store, key);
     return (rem < 0) ? 0 : rem;
 }
 
@@ -109,11 +109,11 @@ int kv_persist(kv_store_t *store, const char *key) {
         return KV_ERR_INVALID_PARAM;
     }
 
-    pthread_mutex_lock(&store->lock);
+    kv_acquire_bucket_lock(store, key);
 
     kv_entry_t *entry = find_entry_unlocked(store, key);
     if (entry == NULL || entry->expire_at_ms == 0) {
-        pthread_mutex_unlock(&store->lock);
+        kv_release_bucket_lock(store, key);
         return 0;
     }
 
@@ -126,7 +126,7 @@ int kv_persist(kv_store_t *store, const char *key) {
     append_aof_rewrite_buffer(store, key, strlen(key));
     append_aof_rewrite_buffer(store, "\t0\n", 3);
 
-    pthread_mutex_unlock(&store->lock);
+    kv_release_bucket_lock(store, key);
     return 1;
 }
 
@@ -135,10 +135,10 @@ size_t kv_expire_sample_sweep(kv_store_t *store, size_t sample_size, size_t max_
         return 0U;
     }
 
-    pthread_mutex_lock(&store->lock);
+    kv_acquire_all_locks(store);
 
     if (store->size == 0U) {
-        pthread_mutex_unlock(&store->lock);
+        kv_release_all_locks(store);
         return 0U;
     }
 
@@ -185,7 +185,7 @@ size_t kv_expire_sample_sweep(kv_store_t *store, size_t sample_size, size_t max_
         }
     }
 
-    pthread_mutex_unlock(&store->lock);
+    kv_release_all_locks(store);
     return deleted;
 }
 
@@ -244,8 +244,8 @@ int kv_evict_lru(kv_store_t *store) {
     if (store == NULL || !store->lock_initialized) {
         return KV_ERR_INVALID_PARAM;
     }
-    pthread_mutex_lock(&store->lock);
+    kv_acquire_all_locks(store);
     int res = kv_evict_lru_unlocked(store);
-    pthread_mutex_unlock(&store->lock);
+    kv_release_all_locks(store);
     return res;
 }

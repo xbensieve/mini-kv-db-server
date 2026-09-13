@@ -13,11 +13,14 @@
 #include <stdlib.h>
 #include <inttypes.h>
 
-void protocol_execute_command(server_t *server, char *line, size_t len,
+#include "replication.h"
+
+void protocol_execute_command(server_t *server, int client_fd, char *line, size_t len,
                                    char *resp_buf, size_t resp_buf_size,
-                                   size_t *out_len, int *out_close) {
+                                   size_t *out_len, int *out_close, int *out_detach) {
     *out_len = 0U;
     *out_close = 0;
+    *out_detach = 0;
 
     if (len == 0U) {
         const char *msg = "ERR empty_command\r\n";
@@ -36,6 +39,27 @@ void protocol_execute_command(server_t *server, char *line, size_t len,
 
     if (cmd[0] == '\0') {
         const char *msg = "ERR empty_command\r\n";
+        *out_len = strlen(msg);
+        memcpy(resp_buf, msg, *out_len);
+        return;
+    }
+
+    if (strcmp(cmd, "SYNC") == 0) {
+        if (replication_handle_sync(&g_replication_state, client_fd) == 0) {
+            *out_detach = 1;
+        } else {
+            *out_close = 1;
+        }
+        return;
+    }
+
+    int is_write = (strcmp(cmd, "SET") == 0 || strcmp(cmd, "DELETE") == 0 ||
+                    strcmp(cmd, "LPUSH") == 0 || strcmp(cmd, "SADD") == 0 ||
+                    strcmp(cmd, "SREM") == 0 || strcmp(cmd, "EXPIRE") == 0 ||
+                    strcmp(cmd, "PEXPIRE") == 0 || strcmp(cmd, "PERSIST") == 0);
+
+    if (is_write && g_replication_state.mode == REPLICA_MODE_REPLICA) {
+        const char *msg = "-ERR Server is running in read-only replica mode\r\n";
         *out_len = strlen(msg);
         memcpy(resp_buf, msg, *out_len);
         return;

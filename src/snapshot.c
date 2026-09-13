@@ -179,9 +179,9 @@ int kv_save(kv_store_t *store, const char *filename) {
         return KV_ERR_INVALID_PARAM;
     }
 
-    pthread_mutex_lock(&store->lock);
+    kv_acquire_all_locks(store);
     int res = kv_save_internal_unlocked(store, filename);
-    pthread_mutex_unlock(&store->lock);
+    kv_release_all_locks(store);
     return res;
 }
 
@@ -190,25 +190,25 @@ int kv_bgsave(kv_store_t *store, const char *filename) {
         return KV_ERR_INVALID_PARAM;
     }
 
-    pthread_mutex_lock(&store->lock);
+    kv_acquire_all_locks(store);
 
     if (store->bgsave_pid != 0 || store->aof_rewrite_pid != 0) {
-        pthread_mutex_unlock(&store->lock);
+        kv_release_all_locks(store);
         return KV_ERR_AGAIN;
     }
 
     pid_t pid = fork();
     if (pid < 0) {
-        pthread_mutex_unlock(&store->lock);
+        kv_release_all_locks(store);
         return KV_ERR_IO;
     } else if (pid == 0) {
         /* Child process: isolated address space, strictly NO mutex locking */
         int res = kv_save_internal_unlocked(store, filename);
         _exit(res == KV_OK ? 0 : 1);
     } else {
-        /* Parent process: record child pid and release mutex */
+        /* Parent process: record child pid and release mutexes */
         store->bgsave_pid = pid;
-        pthread_mutex_unlock(&store->lock);
+        kv_release_all_locks(store);
         return KV_OK;
     }
 }

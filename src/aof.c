@@ -138,9 +138,9 @@ int replay_aof_log(kv_store_t *store, const char *path) {
 
 void kv_set_durability(kv_store_t *store, int level) {
     if (store != NULL) {
-        pthread_mutex_lock(&store->lock);
+        pthread_mutex_lock(&store->aof_lock);
         store->durability_level = level;
-        pthread_mutex_unlock(&store->lock);
+        pthread_mutex_unlock(&store->aof_lock);
     }
 }
 
@@ -148,25 +148,25 @@ int kv_sync(kv_store_t *store) {
     if (store == NULL) {
         return KV_ERR_INVALID_PARAM;
     }
-    pthread_mutex_lock(&store->lock);
+    pthread_mutex_lock(&store->aof_lock);
     if (g_io_fail) {
-        pthread_mutex_unlock(&store->lock);
+        pthread_mutex_unlock(&store->aof_lock);
         return KV_ERR_IO;
     }
     if (store->aof_fp == NULL) {
-        pthread_mutex_unlock(&store->lock);
+        pthread_mutex_unlock(&store->aof_lock);
         return KV_OK;
     }
     if (fflush(store->aof_fp) != 0) {
-        pthread_mutex_unlock(&store->lock);
+        pthread_mutex_unlock(&store->aof_lock);
         return KV_ERR_IO;
     }
     int fd = fileno(store->aof_fp);
     if (fd >= 0 && fsync(fd) != 0) {
-        pthread_mutex_unlock(&store->lock);
+        pthread_mutex_unlock(&store->aof_lock);
         return KV_ERR_IO;
     }
-    pthread_mutex_unlock(&store->lock);
+    pthread_mutex_unlock(&store->aof_lock);
     return KV_OK;
 }
 
@@ -174,7 +174,21 @@ const char *kv_aof_path(const kv_store_t *store) {
     return (store != NULL) ? store->aof_path : NULL;
 }
 
+#include "replication.h"
+
 int write_aof_record(kv_store_t *store, const char *format, const char *arg1, const char *arg2, long *out_pos) {
+    char buf[4096];
+    int n;
+    if (arg2 != NULL) {
+        n = snprintf(buf, sizeof(buf), format, arg1, arg2);
+    } else {
+        n = snprintf(buf, sizeof(buf), format, arg1);
+    }
+    
+    if (n > 0 && (size_t)n < sizeof(buf)) {
+        replication_broadcast(&g_replication_state, buf, (size_t)n);
+    }
+
     if (store == NULL || store->aof_fp == NULL) {
         return KV_OK;
     }
@@ -182,35 +196,42 @@ int write_aof_record(kv_store_t *store, const char *format, const char *arg1, co
         return KV_ERR_IO;
     }
 
+    pthread_mutex_lock(&store->aof_lock);
+
     long pos = ftell(store->aof_fp);
     if (pos < 0) {
+        pthread_mutex_unlock(&store->aof_lock);
         return KV_ERR_IO;
     }
     if (out_pos != NULL) {
         *out_pos = pos;
     }
 
-    int ret;
-    if (arg2 != NULL) {
-        ret = fprintf(store->aof_fp, format, arg1, arg2);
+    if (n > 0 && (size_t)n < sizeof(buf)) {
+        if (fwrite(buf, 1, (size_t)n, store->aof_fp) != (size_t)n) {
+            pthread_mutex_unlock(&store->aof_lock);
+            return KV_ERR_IO;
+        }
     } else {
-        ret = fprintf(store->aof_fp, format, arg1);
-    }
-    if (ret < 0) {
+        pthread_mutex_unlock(&store->aof_lock);
         return KV_ERR_IO;
     }
 
     if (store->durability_level >= KV_DURABILITY_FLUSH) {
         if (fflush(store->aof_fp) != 0) {
+            pthread_mutex_unlock(&store->aof_lock);
             return KV_ERR_IO;
         }
     }
     if (store->durability_level >= KV_DURABILITY_SYNC) {
         int fd = fileno(store->aof_fp);
         if (fd >= 0 && fsync(fd) != 0) {
+            pthread_mutex_unlock(&store->aof_lock);
             return KV_ERR_IO;
         }
     }
+
+    pthread_mutex_unlock(&store->aof_lock);
     return KV_OK;
 }
 
@@ -222,6 +243,7 @@ int write_aof_pexpireat(kv_store_t *store, const char *key, int64_t expire_ms, l
 
 void rollback_aof_record(kv_store_t *store, long pos) {
     if (store != NULL && store->aof_fp != NULL && pos >= 0) {
+        pthread_mutex_lock(&store->aof_lock);
         fflush(store->aof_fp);
         int fd = fileno(store->aof_fp);
         if (fd >= 0) {
@@ -230,6 +252,7 @@ void rollback_aof_record(kv_store_t *store, long pos) {
             }
         }
         fseek(store->aof_fp, pos, SEEK_SET);
+        pthread_mutex_unlock(&store->aof_lock);
     }
 }
 
@@ -238,10 +261,10 @@ int kv_bgrewriteaof(kv_store_t *store) {
         return KV_ERR_INVALID_PARAM;
     }
 
-    pthread_mutex_lock(&store->lock);
+    kv_acquire_all_locks(store);
 
     if (store->bgsave_pid > 0 || store->aof_rewrite_pid > 0) {
-        pthread_mutex_unlock(&store->lock);
+        kv_release_all_locks(store);
         return KV_ERR_AGAIN;
     }
 
@@ -255,7 +278,7 @@ int kv_bgrewriteaof(kv_store_t *store) {
 
     pid_t pid = fork();
     if (pid < 0) {
-        pthread_mutex_unlock(&store->lock);
+        kv_release_all_locks(store);
         return KV_ERR_IO;
     } else if (pid == 0) {
         /* Child process */
@@ -311,7 +334,7 @@ int kv_bgrewriteaof(kv_store_t *store) {
     } else {
         /* Parent process */
         store->aof_rewrite_pid = pid;
-        pthread_mutex_unlock(&store->lock);
+        kv_release_all_locks(store);
         return KV_OK;
     }
 }
@@ -321,10 +344,10 @@ int kv_merge_aof_rewrite(kv_store_t *store, pid_t child_pid) {
         return KV_ERR_INVALID_PARAM;
     }
 
-    pthread_mutex_lock(&store->lock);
+    kv_acquire_all_locks(store);
 
     if (store->aof_rewrite_pid != child_pid) {
-        pthread_mutex_unlock(&store->lock);
+        kv_release_all_locks(store);
         return KV_ERR_INVALID_PARAM;
     }
 
@@ -335,7 +358,7 @@ int kv_merge_aof_rewrite(kv_store_t *store, pid_t child_pid) {
     if (tf == NULL) {
         store->aof_rewrite_pid = 0;
         store->aof_rewrite_buf_len = 0U;
-        pthread_mutex_unlock(&store->lock);
+        kv_release_all_locks(store);
         return KV_ERR_IO;
     }
 
@@ -344,7 +367,7 @@ int kv_merge_aof_rewrite(kv_store_t *store, pid_t child_pid) {
             fclose(tf);
             store->aof_rewrite_pid = 0;
             store->aof_rewrite_buf_len = 0U;
-            pthread_mutex_unlock(&store->lock);
+            kv_release_all_locks(store);
             return KV_ERR_IO;
         }
     }
@@ -364,7 +387,7 @@ int kv_merge_aof_rewrite(kv_store_t *store, pid_t child_pid) {
     if (rename(tmp_path, store->aof_path) != 0) {
         store->aof_rewrite_pid = 0;
         store->aof_rewrite_buf_len = 0U;
-        pthread_mutex_unlock(&store->lock);
+        kv_release_all_locks(store);
         return KV_ERR_IO;
     }
 
@@ -373,10 +396,25 @@ int kv_merge_aof_rewrite(kv_store_t *store, pid_t child_pid) {
     store->aof_rewrite_buf_len = 0U;
 
     if (store->aof_fp == NULL) {
-        pthread_mutex_unlock(&store->lock);
+        kv_release_all_locks(store);
         return KV_ERR_IO;
     }
 
-    pthread_mutex_unlock(&store->lock);
+    kv_release_all_locks(store);
     return KV_OK;
+}
+
+void kv_discard_aof_rewrite(kv_store_t *store) {
+    if (store == NULL) {
+        return;
+    }
+    kv_acquire_all_locks(store);
+    store->aof_rewrite_pid = 0;
+    if (store->aof_rewrite_buf != NULL) {
+        free(store->aof_rewrite_buf);
+        store->aof_rewrite_buf = NULL;
+    }
+    store->aof_rewrite_buf_len = 0U;
+    store->aof_rewrite_buf_cap = 0U;
+    kv_release_all_locks(store);
 }

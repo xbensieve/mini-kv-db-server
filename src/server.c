@@ -6,6 +6,7 @@
 #include "thread_pool.h"
 #include "protocol.h"
 #include "eviction.h"
+#include "kv_internal.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -162,13 +163,15 @@ static void server_worker_client_task(void *arg) {
         char resp_buf[SERVER_MAX_LINE_LEN + 128U];
         size_t resp_len = 0U;
         int should_close = 0;
+        int should_detach = 0;
 
-        protocol_execute_command(server, cmd->line, cmd->len,
+        protocol_execute_command(server, client->fd, cmd->line, cmd->len,
                                resp_buf, sizeof(resp_buf), &resp_len,
-                               &should_close);
+                               &should_close, &should_detach);
         free(cmd);
 
         int do_close = 0;
+        int do_detach = 0;
         pthread_mutex_lock(&client->client_lock);
         if (!client->closed && client->fd >= 0 && resp_len > 0U) {
             if (server_send_all(client->fd, resp_buf, resp_len) != 0) {
@@ -178,9 +181,16 @@ static void server_worker_client_task(void *arg) {
         if (should_close) {
             do_close = 1;
         }
+        if (should_detach) {
+            do_detach = 1;
+            if (server->epoll_fd >= 0 && client->fd >= 0) {
+                epoll_ctl(server->epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
+            }
+            client->fd = -1; // Detached, don't close it
+        }
         pthread_mutex_unlock(&client->client_lock);
 
-        if (do_close) {
+        if (do_detach || do_close) {
             server_close_client(server, client);
             break;
         }
@@ -573,15 +583,7 @@ int server_run(server_t *server) {
                 } else {
                     printf("Background AOF rewrite failed or terminated. Discarding...\n");
                     /* Clean up state */
-                    pthread_mutex_lock(&server->store->lock);
-                    server->store->aof_rewrite_pid = 0;
-                    if (server->store->aof_rewrite_buf) {
-                        free(server->store->aof_rewrite_buf);
-                        server->store->aof_rewrite_buf = NULL;
-                    }
-                    server->store->aof_rewrite_buf_len = 0;
-                    server->store->aof_rewrite_buf_cap = 0;
-                    pthread_mutex_unlock(&server->store->lock);
+                    kv_discard_aof_rewrite(server->store);
                     
                     /* Delete temp file */
                     char tmp_path[512];

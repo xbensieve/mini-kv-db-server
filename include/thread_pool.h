@@ -9,7 +9,7 @@
 
 /**
  * @file thread_pool.h
- * @brief Generic POSIX Thread Pool with bounded task queue (Phase 07).
+ * @brief Generic POSIX Thread Pool with bounded task queue.
  *
  * Implements a fixed-size worker pool executing tasks submitted from an event loop.
  * The task queue is structured as a bounded ring buffer protected by a queue mutex

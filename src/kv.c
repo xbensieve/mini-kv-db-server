@@ -203,6 +203,11 @@ void append_aof_rewrite_buffer(kv_store_t *store, const char *data, size_t len) 
     if (store == NULL || data == NULL || len == 0U || store->aof_rewrite_pid <= 0) {
         return;
     }
+    pthread_mutex_lock(&store->aof_lock);
+    if (store->aof_rewrite_pid <= 0) {
+        pthread_mutex_unlock(&store->aof_lock);
+        return;
+    }
     if (store->aof_rewrite_buf == NULL) {
         store->aof_rewrite_buf_cap = (len > 4096U) ? len * 2U : 4096U;
         store->aof_rewrite_buf = malloc(store->aof_rewrite_buf_cap);
@@ -217,6 +222,7 @@ void append_aof_rewrite_buffer(kv_store_t *store, const char *data, size_t len) 
         memcpy(store->aof_rewrite_buf + store->aof_rewrite_buf_len, data, len);
         store->aof_rewrite_buf_len += len;
     }
+    pthread_mutex_unlock(&store->aof_lock);
 }
 
 int kv_init(kv_store_t *store, size_t bucket_count) {
@@ -235,6 +241,58 @@ int kv_init_with_aof(kv_store_t *store, size_t bucket_count, const char *aof_pat
     return kv_init_full(store, bucket_count, KV_DEFAULT_MAX_CAPACITY, KV_DEFAULT_MEMORY_BUDGET, aof_path);
 }
 
+#define KV_DEFAULT_NUM_LOCKS 32U
+
+size_t kv_lock_index(const kv_store_t *store, const char *key) {
+    if (store == NULL || store->num_locks == 0U || key == NULL) {
+        return 0U;
+    }
+    return hash_key(key, store->num_locks);
+}
+
+void kv_acquire_bucket_lock(kv_store_t *store, const char *key) {
+    if (store != NULL && store->lock_initialized && store->bucket_locks != NULL && key != NULL) {
+        size_t idx = kv_lock_index(store, key);
+        pthread_mutex_lock(&store->bucket_locks[idx]);
+    }
+}
+
+void kv_release_bucket_lock(kv_store_t *store, const char *key) {
+    if (store != NULL && store->lock_initialized && store->bucket_locks != NULL && key != NULL) {
+        size_t idx = kv_lock_index(store, key);
+        pthread_mutex_unlock(&store->bucket_locks[idx]);
+    }
+}
+
+void kv_acquire_all_locks(kv_store_t *store) {
+    if (store != NULL && store->lock_initialized && store->bucket_locks != NULL) {
+        for (size_t i = 0U; i < store->num_locks; ++i) {
+            pthread_mutex_lock(&store->bucket_locks[i]);
+        }
+    }
+}
+
+void kv_release_all_locks(kv_store_t *store) {
+    if (store != NULL && store->lock_initialized && store->bucket_locks != NULL) {
+        for (size_t i = store->num_locks; i > 0U; --i) {
+            pthread_mutex_unlock(&store->bucket_locks[i - 1U]);
+        }
+    }
+}
+
+static void destroy_store_locks(kv_store_t *store) {
+    if (store != NULL && store->lock_initialized && store->bucket_locks != NULL) {
+        for (size_t i = 0U; i < store->num_locks; ++i) {
+            pthread_mutex_destroy(&store->bucket_locks[i]);
+        }
+        pthread_mutex_destroy(&store->aof_lock);
+        free(store->bucket_locks);
+        store->bucket_locks = NULL;
+        store->num_locks = 0U;
+        store->lock_initialized = 0;
+    }
+}
+
 int kv_init_full(kv_store_t *store, size_t bucket_count, size_t max_capacity, size_t max_memory_budget, const char *aof_path) {
     if (store == NULL || bucket_count == 0U) {
         return KV_ERR_INVALID_PARAM;
@@ -251,27 +309,43 @@ int kv_init_full(kv_store_t *store, size_t bucket_count, size_t max_capacity, si
     }
 
     store->buckets = buckets;
-    store->bucket_count = bucket_count;
-    store->size = 0U;
-    store->max_capacity = max_capacity;
-    store->allocated_bytes = buckets_bytes;
-    store->peak_allocated_bytes = buckets_bytes;
-    store->max_memory_budget = max_memory_budget;
-    store->auto_resize = 1;
+    atomic_init(&store->bucket_count, bucket_count);
+    atomic_init(&store->size, 0U);
+    atomic_init(&store->max_capacity, max_capacity);
+    atomic_init(&store->allocated_bytes, buckets_bytes);
+    atomic_init(&store->peak_allocated_bytes, buckets_bytes);
+    atomic_init(&store->max_memory_budget, max_memory_budget);
+    atomic_init(&store->auto_resize, 1);
     store->aof_fp = NULL;
     store->aof_path = NULL;
     store->durability_level = KV_DURABILITY_FLUSH;
-    store->lru_clock = 0U;
+    atomic_init(&store->lru_clock, 0U);
     store->bgsave_pid = 0;
     store->aof_rewrite_pid = 0;
     store->aof_rewrite_buf = NULL;
     store->aof_rewrite_buf_len = 0U;
     store->aof_rewrite_buf_cap = 0U;
 
+    store->num_locks = bucket_count;
+    if (store->num_locks > 64U) {
+        store->num_locks = 64U;
+    } else if (store->num_locks < KV_DEFAULT_NUM_LOCKS) {
+        store->num_locks = KV_DEFAULT_NUM_LOCKS;
+    }
+    store->bucket_locks = calloc(store->num_locks, sizeof(pthread_mutex_t));
+    if (store->bucket_locks == NULL) {
+        tracked_free(store->buckets);
+        store->buckets = NULL;
+        return KV_ERR_INTERNAL;
+    }
+
     pthread_mutexattr_t attr;
     pthread_mutexattr_init(&attr);
     pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
-    pthread_mutex_init(&store->lock, &attr);
+    for (size_t i = 0U; i < store->num_locks; ++i) {
+        pthread_mutex_init(&store->bucket_locks[i], &attr);
+    }
+    pthread_mutex_init(&store->aof_lock, &attr);
     pthread_mutexattr_destroy(&attr);
     store->lock_initialized = 1;
 
@@ -280,8 +354,7 @@ int kv_init_full(kv_store_t *store, size_t bucket_count, size_t max_capacity, si
         size_t path_bytes = path_len + 1U;
 
         if (max_memory_budget > 0U && store->allocated_bytes + path_bytes > max_memory_budget) {
-            pthread_mutex_destroy(&store->lock);
-            store->lock_initialized = 0;
+            destroy_store_locks(store);
             tracked_free(store->buckets);
             store->buckets = NULL;
             return KV_ERR_BUDGET_EXCEEDED;
@@ -289,8 +362,7 @@ int kv_init_full(kv_store_t *store, size_t bucket_count, size_t max_capacity, si
 
         store->aof_path = tracked_malloc(path_bytes);
         if (store->aof_path == NULL) {
-            pthread_mutex_destroy(&store->lock);
-            store->lock_initialized = 0;
+            destroy_store_locks(store);
             tracked_free(store->buckets);
             store->buckets = NULL;
             return KV_ERR_INTERNAL;
@@ -307,8 +379,7 @@ int kv_init_full(kv_store_t *store, size_t bucket_count, size_t max_capacity, si
 
         store->aof_fp = fopen(aof_path, "a+");
         if (store->aof_fp == NULL) {
-            pthread_mutex_destroy(&store->lock);
-            store->lock_initialized = 0;
+            destroy_store_locks(store);
             tracked_free(store->aof_path);
             store->aof_path = NULL;
             tracked_free(store->buckets);
@@ -320,26 +391,22 @@ int kv_init_full(kv_store_t *store, size_t bucket_count, size_t max_capacity, si
     return KV_OK;
 }
 
-int kv_resize(kv_store_t *store, size_t new_bucket_count) {
+int kv_resize_unlocked(kv_store_t *store, size_t new_bucket_count) {
     if (store == NULL || new_bucket_count == 0U) {
         return KV_ERR_INVALID_PARAM;
     }
-
-    pthread_mutex_lock(&store->lock);
 
     size_t new_buckets_bytes = new_bucket_count * sizeof(kv_entry_t *);
     size_t old_buckets_bytes = store->bucket_count * sizeof(kv_entry_t *);
 
     if (store->max_memory_budget > 0U) {
         if (store->allocated_bytes + new_buckets_bytes > store->max_memory_budget) {
-            pthread_mutex_unlock(&store->lock);
             return KV_ERR_BUDGET_EXCEEDED;
         }
     }
 
     kv_entry_t **new_buckets = tracked_calloc(new_bucket_count, sizeof(kv_entry_t *));
     if (new_buckets == NULL) {
-        pthread_mutex_unlock(&store->lock);
         return KV_ERR_INTERNAL;
     }
 
@@ -364,15 +431,25 @@ int kv_resize(kv_store_t *store, size_t new_bucket_count) {
     store->bucket_count = new_bucket_count;
     store->allocated_bytes -= old_buckets_bytes;
 
-    pthread_mutex_unlock(&store->lock);
     return KV_OK;
+}
+
+int kv_resize(kv_store_t *store, size_t new_bucket_count) {
+    if (store == NULL || new_bucket_count == 0U) {
+        return KV_ERR_INVALID_PARAM;
+    }
+
+    kv_acquire_all_locks(store);
+    int res = kv_resize_unlocked(store, new_bucket_count);
+    kv_release_all_locks(store);
+    return res;
 }
 
 void kv_set_auto_resize(kv_store_t *store, int enabled) {
     if (store != NULL) {
-        pthread_mutex_lock(&store->lock);
+        kv_acquire_all_locks(store);
         store->auto_resize = enabled ? 1 : 0;
-        pthread_mutex_unlock(&store->lock);
+        kv_release_all_locks(store);
     }
 }
 
@@ -383,17 +460,17 @@ size_t kv_bucket_count(const kv_store_t *store) {
 
 void kv_set_max_capacity(kv_store_t *store, size_t max_capacity) {
     if (store != NULL) {
-        pthread_mutex_lock(&store->lock);
+        kv_acquire_all_locks(store);
         store->max_capacity = max_capacity;
-        pthread_mutex_unlock(&store->lock);
+        kv_release_all_locks(store);
     }
 }
 
 void kv_set_memory_budget(kv_store_t *store, size_t budget_bytes) {
     if (store != NULL) {
-        pthread_mutex_lock(&store->lock);
+        kv_acquire_all_locks(store);
         store->max_memory_budget = budget_bytes;
-        pthread_mutex_unlock(&store->lock);
+        kv_release_all_locks(store);
     }
 }
 
@@ -418,7 +495,7 @@ void kv_destroy(kv_store_t *store) {
     }
 
     if (store->lock_initialized) {
-        pthread_mutex_lock(&store->lock);
+        kv_acquire_all_locks(store);
     }
 
     for (size_t i = 0U; i < store->bucket_count; ++i) {
@@ -462,9 +539,8 @@ void kv_destroy(kv_store_t *store) {
     store->peak_allocated_bytes = 0U;
 
     if (store->lock_initialized) {
-        pthread_mutex_unlock(&store->lock);
-        pthread_mutex_destroy(&store->lock);
-        store->lock_initialized = 0;
+        kv_release_all_locks(store);
+        destroy_store_locks(store);
     }
 }
 
@@ -559,12 +635,6 @@ int kv_set_internal(kv_store_t *store, const char *key, const char *value) {
         }
     }
 
-    /* Check auto resize */
-    if (store->auto_resize && ((store->size + 1U) * KV_LOAD_FACTOR_DEN >= store->bucket_count * KV_LOAD_FACTOR_NUM)) {
-        kv_resize(store, store->bucket_count * 2U);
-        index = hash_key(key, store->bucket_count);
-    }
-
     kv_entry_t *entry = tracked_malloc(sizeof(kv_entry_t));
     if (entry == NULL) {
         return KV_ERR_INTERNAL;
@@ -607,24 +677,56 @@ int kv_set(kv_store_t *store, const char *key, const char *value) {
         return KV_ERR_INVALID_PARAM;
     }
 
-    pthread_mutex_lock(&store->lock);
-
-    int err = validate_key(key, NULL);
+    size_t key_len = 0U;
+    size_t val_len = 0U;
+    int err = validate_key(key, &key_len);
     if (err != KV_OK) {
-        pthread_mutex_unlock(&store->lock);
         return err;
     }
-    err = validate_value(value, NULL);
+    err = validate_value(value, &val_len);
     if (err != KV_OK) {
-        pthread_mutex_unlock(&store->lock);
         return err;
+    }
+
+    size_t entry_bytes = sizeof(kv_entry_t) + key_len + 1U + val_len + 1U;
+    int is_global = 0;
+    if (store->auto_resize && ((store->size + 1U) * KV_LOAD_FACTOR_DEN >= store->bucket_count * KV_LOAD_FACTOR_NUM)) {
+        is_global = 1;
+    }
+    if (store->max_memory_budget > 0U && store->allocated_bytes + entry_bytes > store->max_memory_budget) {
+        is_global = 1;
+    }
+
+    if (is_global) {
+        kv_acquire_all_locks(store);
+        /* Re-check under global locks: resize if load factor is exceeded */
+        if (store->auto_resize && ((store->size + 1U) * KV_LOAD_FACTOR_DEN >= store->bucket_count * KV_LOAD_FACTOR_NUM)) {
+            kv_resize_unlocked(store, store->bucket_count * 2U);
+        }
+    } else {
+        kv_acquire_bucket_lock(store, key);
+        /* Re-check under lock; if another thread updated size or allocated_bytes, escalate cleanly */
+        if ((store->auto_resize && ((store->size + 1U) * KV_LOAD_FACTOR_DEN >= store->bucket_count * KV_LOAD_FACTOR_NUM)) ||
+            (store->max_memory_budget > 0U && store->allocated_bytes + entry_bytes > store->max_memory_budget)) {
+            /* Drop bucket lock BEFORE acquiring all locks to prevent circular wait */
+            kv_release_bucket_lock(store, key);
+            kv_acquire_all_locks(store);
+            if (store->auto_resize && ((store->size + 1U) * KV_LOAD_FACTOR_DEN >= store->bucket_count * KV_LOAD_FACTOR_NUM)) {
+                kv_resize_unlocked(store, store->bucket_count * 2U);
+            }
+            is_global = 1;
+        }
     }
 
     long aof_pos = -1;
     if (store->aof_fp != NULL) {
         int aof_err = write_aof_record(store, "SET\t%s\t%s\n", key, value, &aof_pos);
         if (aof_err != KV_OK) {
-            pthread_mutex_unlock(&store->lock);
+            if (is_global) {
+                kv_release_all_locks(store);
+            } else {
+                kv_release_bucket_lock(store, key);
+            }
             return aof_err;
         }
     }
@@ -634,27 +736,31 @@ int kv_set(kv_store_t *store, const char *key, const char *value) {
         rollback_aof_record(store, aof_pos);
     }
 
-    pthread_mutex_unlock(&store->lock);
+    if (is_global) {
+        kv_release_all_locks(store);
+    } else {
+        kv_release_bucket_lock(store, key);
+    }
     return res;
 }
 
 const char *kv_get(const kv_store_t *store, const char *key) {
-    if (store == NULL || !store->lock_initialized) {
+    if (store == NULL || !store->lock_initialized || key == NULL) {
         return NULL;
     }
-    pthread_mutex_lock((pthread_mutex_t *)&store->lock);
+    kv_acquire_bucket_lock((kv_store_t *)store, key);
     kv_entry_t *entry = find_entry_unlocked(store, key);
     if (entry == NULL) {
-        pthread_mutex_unlock((pthread_mutex_t *)&store->lock);
+        kv_release_bucket_lock((kv_store_t *)store, key);
         return NULL;
     }
     if (entry->type != KV_TYPE_STRING) {
-        pthread_mutex_unlock((pthread_mutex_t *)&store->lock);
+        kv_release_bucket_lock((kv_store_t *)store, key);
         return NULL;
     }
     entry->last_accessed_time = ++((kv_store_t *)store)->lru_clock;
     const char *val = entry->value;
-    pthread_mutex_unlock((pthread_mutex_t *)&store->lock);
+    kv_release_bucket_lock((kv_store_t *)store, key);
     return val;
 }
 
@@ -689,18 +795,18 @@ int kv_delete(kv_store_t *store, const char *key) {
     if (store == NULL || !store->lock_initialized) {
         return KV_ERR_INVALID_PARAM;
     }
-    pthread_mutex_lock(&store->lock);
     int err = validate_key(key, NULL);
     if (err != KV_OK) {
-        pthread_mutex_unlock(&store->lock);
         return KV_ERR_INVALID_PARAM;
     }
+
+    kv_acquire_bucket_lock(store, key);
 
     long aof_pos = -1;
     if (store->aof_fp != NULL) {
         int aof_err = write_aof_record(store, "DELETE\t%s\n", key, NULL, &aof_pos);
         if (aof_err != KV_OK) {
-            pthread_mutex_unlock(&store->lock);
+            kv_release_bucket_lock(store, key);
             return aof_err;
         }
     }
@@ -710,16 +816,16 @@ int kv_delete(kv_store_t *store, const char *key) {
         rollback_aof_record(store, aof_pos);
     }
 
-    pthread_mutex_unlock(&store->lock);
+    kv_release_bucket_lock(store, key);
     return res;
 }
 
 int kv_exists(const kv_store_t *store, const char *key) {
-    if (store == NULL || !store->lock_initialized) {
+    if (store == NULL || !store->lock_initialized || key == NULL) {
         return 0;
     }
-    pthread_mutex_lock((pthread_mutex_t *)&store->lock);
+    kv_acquire_bucket_lock((kv_store_t *)store, key);
     int exists = (find_entry_unlocked(store, key) != NULL);
-    pthread_mutex_unlock((pthread_mutex_t *)&store->lock);
+    kv_release_bucket_lock((kv_store_t *)store, key);
     return exists;
 }

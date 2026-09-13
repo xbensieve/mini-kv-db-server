@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  master:
+    build: .
+    ports:
+      - "8888:8888"
+    command: ["--port", "8888", "--workers", "4"]
+    volumes:
+      - master_data:/app/data
+
+  replica:
+    build: .
+    ports:
+      - "8889:8888"
+    command: ["--port", "8888", "--workers", "4", "--replicaof", "master", "8888"]
+    depends_on:
+      - master
+    volumes:
+      - replica_data:/app/data
+
+volumes:
+  master_data:
+  replica_data:

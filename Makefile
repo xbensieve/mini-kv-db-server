@@ -3,12 +3,12 @@ CFLAGS ?= -std=c17 -O0 -g -Wall -Wextra -Wpedantic -Wconversion -Wshadow
 LDFLAGS ?= -pthread
 SAN_FLAGS ?= -fsanitize=address,undefined -fno-omit-frame-pointer
 
-SRC := $(wildcard src/*.c)
-OBJ := $(SRC:.c=.o)
-BIN := bin/mini-kv
-
-MODULAR_LIB_SRC := src/kv.c src/aof.c src/eviction.c src/list.c src/set.c src/snapshot.c
+MODULAR_LIB_SRC := src/kv.c src/aof.c src/eviction.c src/list.c src/set.c src/snapshot.c src/replication.c
 SERVER_LIB_SRC := $(MODULAR_LIB_SRC) src/server.c src/protocol.c src/thread_pool.c
+SERVER_SRC := src/main.c $(SERVER_LIB_SRC)
+SERVER_OBJ := $(SERVER_SRC:.c=.o)
+BIN := bin/mini-kv
+BENCH_BIN := bin/mini-kv-benchmark
 
 # Unit test suites (meaningfully named)
 TEST_CRUD_SRC := tests/test_crud_operations.c $(MODULAR_LIB_SRC)
@@ -55,8 +55,12 @@ TEST_DATA_STRUCTURES_SRC := tests/test_data_structures.c $(MODULAR_LIB_SRC)
 TEST_DATA_STRUCTURES_BIN := bin/test_data_structures
 TEST_DATA_STRUCTURES_VAL := bin/test_data_structures_valgrind
 
-TEST_BINS := $(TEST_CRUD_BIN) $(TEST_MEM_BIN) $(TEST_RESIZE_BIN) $(TEST_PERSIST_BIN) $(TEST_TCP_BIN) $(TEST_CONC_BIN) $(TEST_TP_BIN) $(TEST_TTL_BIN) $(TEST_SNAPSHOT_BIN) $(TEST_REWRITE_BIN) $(TEST_DATA_STRUCTURES_BIN)
-VAL_BINS := $(TEST_CRUD_VAL) $(TEST_MEM_VAL) $(TEST_RESIZE_VAL) $(TEST_PERSIST_VAL) $(TEST_TCP_VAL) $(TEST_CONC_VAL) $(TEST_TP_VAL) $(TEST_TTL_VAL) $(TEST_SNAPSHOT_VAL) $(TEST_REWRITE_VAL) $(TEST_DATA_STRUCTURES_VAL)
+TEST_REPLICATION_SRC := tests/test_replication.c $(SERVER_LIB_SRC)
+TEST_REPLICATION_BIN := bin/test_replication
+TEST_REPLICATION_VAL := bin/test_replication_valgrind
+
+TEST_BINS := $(TEST_CRUD_BIN) $(TEST_MEM_BIN) $(TEST_RESIZE_BIN) $(TEST_PERSIST_BIN) $(TEST_TCP_BIN) $(TEST_CONC_BIN) $(TEST_TP_BIN) $(TEST_TTL_BIN) $(TEST_SNAPSHOT_BIN) $(TEST_REWRITE_BIN) $(TEST_DATA_STRUCTURES_BIN) $(TEST_REPLICATION_BIN)
+VAL_BINS := $(TEST_CRUD_VAL) $(TEST_MEM_VAL) $(TEST_RESIZE_VAL) $(TEST_PERSIST_VAL) $(TEST_TCP_VAL) $(TEST_CONC_VAL) $(TEST_TP_VAL) $(TEST_TTL_VAL) $(TEST_SNAPSHOT_VAL) $(TEST_REWRITE_VAL) $(TEST_DATA_STRUCTURES_VAL) $(TEST_REPLICATION_VAL)
 
 # ThreadSanitizer (TSan) configuration
 TSAN_FLAGS ?= -fsanitize=thread -fPIE -pie -g -O1
@@ -71,13 +75,18 @@ TEST_TTL_TSAN := bin/test_ttl_eviction_tsan
 TEST_SNAPSHOT_TSAN := bin/test_snapshot_tsan
 TEST_REWRITE_TSAN := bin/test_aof_rewrite_tsan
 TEST_DATA_STRUCTURES_TSAN := bin/test_data_structures_tsan
-TSAN_BINS := $(TEST_CRUD_TSAN) $(TEST_MEM_TSAN) $(TEST_RESIZE_TSAN) $(TEST_PERSIST_TSAN) $(TEST_TCP_TSAN) $(TEST_CONC_TSAN) $(TEST_TP_TSAN) $(TEST_TTL_TSAN) $(TEST_SNAPSHOT_TSAN) $(TEST_REWRITE_TSAN) $(TEST_DATA_STRUCTURES_TSAN)
+TEST_REPLICATION_TSAN := bin/test_replication_tsan
+TSAN_BINS := $(TEST_CRUD_TSAN) $(TEST_MEM_TSAN) $(TEST_RESIZE_TSAN) $(TEST_PERSIST_TSAN) $(TEST_TCP_TSAN) $(TEST_CONC_TSAN) $(TEST_TP_TSAN) $(TEST_TTL_TSAN) $(TEST_SNAPSHOT_TSAN) $(TEST_REWRITE_TSAN) $(TEST_DATA_STRUCTURES_TSAN) $(TEST_REPLICATION_TSAN)
 
-all: $(BIN)
+all: $(BIN) $(BENCH_BIN)
 
-$(BIN): $(OBJ)
+$(BIN): $(SERVER_OBJ)
 	@mkdir -p bin
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+$(BENCH_BIN): src/benchmark.c
+	@mkdir -p bin
+	$(CC) $(CFLAGS) -Iinclude -o $@ $< $(LDFLAGS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -Iinclude -c $< -o $@
@@ -126,6 +135,10 @@ $(TEST_REWRITE_BIN): $(TEST_REWRITE_SRC) include/kv.h include/thread_pool.h
 $(TEST_DATA_STRUCTURES_BIN): $(TEST_DATA_STRUCTURES_SRC) include/kv.h
 	@mkdir -p bin
 	$(CC) $(CFLAGS) $(SAN_FLAGS) -Iinclude $(TEST_DATA_STRUCTURES_SRC) -o $@ $(LDFLAGS) $(SAN_FLAGS)
+
+$(TEST_REPLICATION_BIN): $(TEST_REPLICATION_SRC) include/kv.h include/replication.h include/server.h include/protocol.h
+	@mkdir -p bin
+	$(CC) $(CFLAGS) $(SAN_FLAGS) -Iinclude $(TEST_REPLICATION_SRC) -o $@ $(LDFLAGS) $(SAN_FLAGS)
 
 # Valgrind test binaries (clean, non-sanitized)
 $(TEST_CRUD_VAL): $(TEST_CRUD_SRC) include/kv.h
@@ -229,6 +242,7 @@ test: $(TEST_BINS)
 	./$(TEST_SNAPSHOT_BIN)
 	./$(TEST_REWRITE_BIN)
 	./$(TEST_DATA_STRUCTURES_BIN)
+	./$(TEST_REPLICATION_BIN)
 
 valgrind: $(VAL_BINS)
 	valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1 ./$(TEST_CRUD_VAL)
@@ -265,6 +279,6 @@ ubsan: LDFLAGS += -fsanitize=undefined
 ubsan: clean all
 
 clean:
-	rm -f $(OBJ) $(BIN) $(TEST_BINS) $(VAL_BINS) $(TSAN_BINS) bin/test_* *.log *.aof tests/*.log tests/*.aof data/*.log data/*.aof test_concurrency.aof *.snap *.snap.tmp
+	rm -f $(SERVER_OBJ) $(BIN) $(BENCH_BIN) $(TEST_BINS) $(VAL_BINS) $(TSAN_BINS) bin/test_* *.log *.aof tests/*.log tests/*.aof data/*.log data/*.aof test_concurrency.aof *.snap *.snap.tmp
 
 .PHONY: all test valgrind asan ubsan tsan clean

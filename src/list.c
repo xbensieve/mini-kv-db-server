@@ -42,51 +42,77 @@ int kv_lpush(kv_store_t *store, const char *key, const char *value) {
     err = validate_value(value, &val_len);
     if (err != KV_OK) return err;
 
-    pthread_mutex_lock(&store->lock);
+    size_t entry_overhead = sizeof(kv_entry_t) + key_len + 1U + sizeof(kv_list_t);
+    size_t node_overhead = sizeof(kv_list_node_t) + val_len + 1U;
+
+    int needs_global = 0;
+    if (store->max_memory_budget > 0U && store->allocated_bytes + entry_overhead + node_overhead > store->max_memory_budget) {
+        needs_global = 1;
+    }
+    if (store->auto_resize && ((store->size + 1U) * KV_LOAD_FACTOR_DEN >= store->bucket_count * KV_LOAD_FACTOR_NUM)) {
+        needs_global = 1;
+    }
+
+    if (needs_global) {
+        kv_acquire_all_locks(store);
+    } else {
+        kv_acquire_bucket_lock(store, key);
+        if ((store->max_memory_budget > 0U && store->allocated_bytes + entry_overhead + node_overhead > store->max_memory_budget) ||
+            (store->auto_resize && ((store->size + 1U) * KV_LOAD_FACTOR_DEN >= store->bucket_count * KV_LOAD_FACTOR_NUM))) {
+            kv_release_bucket_lock(store, key);
+            kv_acquire_all_locks(store);
+            needs_global = 1;
+        }
+    }
 
     kv_entry_t *entry = find_entry_unlocked(store, key);
     kv_list_t *list = NULL;
 
     if (entry != NULL) {
         if (entry->type != KV_TYPE_LIST) {
-            pthread_mutex_unlock(&store->lock);
+            if (needs_global) kv_release_all_locks(store);
+            else kv_release_bucket_lock(store, key);
             return KV_ERR_WRONG_TYPE;
         }
         list = (kv_list_t *)entry->value_ptr;
         entry->last_accessed_time = ++store->lru_clock;
     } else {
         if (store->max_capacity > 0U && store->size >= store->max_capacity) {
-            pthread_mutex_unlock(&store->lock);
+            if (needs_global) kv_release_all_locks(store);
+            else kv_release_bucket_lock(store, key);
             return KV_ERR_CAPACITY_FULL;
         }
 
-        size_t entry_overhead = sizeof(kv_entry_t) + key_len + 1U + sizeof(kv_list_t);
         if (store->max_memory_budget > 0U) {
             while (store->allocated_bytes + entry_overhead > store->max_memory_budget && store->size > 0U) {
                 if (kv_evict_lru_unlocked(store) != KV_OK) break;
             }
             if (store->allocated_bytes + entry_overhead > store->max_memory_budget) {
-                pthread_mutex_unlock(&store->lock);
+                if (needs_global) kv_release_all_locks(store);
+                else kv_release_bucket_lock(store, key);
                 return KV_ERR_BUDGET_EXCEEDED;
             }
         }
 
         entry = tracked_malloc(sizeof(kv_entry_t));
         if (entry == NULL) {
-            pthread_mutex_unlock(&store->lock);
+            if (needs_global) kv_release_all_locks(store);
+            else kv_release_bucket_lock(store, key);
             return KV_ERR_INTERNAL;
         }
         entry->key = copy_string_bounded(key, KV_MAX_KEY_LEN);
         if (entry->key == NULL) {
             tracked_free(entry);
-            pthread_mutex_unlock(&store->lock);
+            if (needs_global) kv_release_all_locks(store);
+            else kv_release_bucket_lock(store, key);
             return KV_ERR_INTERNAL;
         }
         list = tracked_calloc(1U, sizeof(kv_list_t));
         if (list == NULL) {
             tracked_free(entry->key);
             tracked_free(entry);
-            pthread_mutex_unlock(&store->lock);
+            if (needs_global) kv_release_all_locks(store);
+            else kv_release_bucket_lock(store, key);
             return KV_ERR_INTERNAL;
         }
         entry->type = KV_TYPE_LIST;
@@ -104,26 +130,28 @@ int kv_lpush(kv_store_t *store, const char *key, const char *value) {
         }
     }
 
-    size_t node_overhead = sizeof(kv_list_node_t) + val_len + 1U;
     if (store->max_memory_budget > 0U) {
         while (store->allocated_bytes + node_overhead > store->max_memory_budget && store->size > 0U) {
             if (kv_evict_lru_unlocked(store) != KV_OK) break;
         }
         if (store->allocated_bytes + node_overhead > store->max_memory_budget) {
-            pthread_mutex_unlock(&store->lock);
+            if (needs_global) kv_release_all_locks(store);
+            else kv_release_bucket_lock(store, key);
             return KV_ERR_BUDGET_EXCEEDED;
         }
     }
 
     kv_list_node_t *node = tracked_malloc(sizeof(kv_list_node_t));
     if (node == NULL) {
-        pthread_mutex_unlock(&store->lock);
+        if (needs_global) kv_release_all_locks(store);
+        else kv_release_bucket_lock(store, key);
         return KV_ERR_INTERNAL;
     }
     node->value = copy_string_bounded(value, KV_MAX_VALUE_LEN);
     if (node->value == NULL) {
         tracked_free(node);
-        pthread_mutex_unlock(&store->lock);
+        if (needs_global) kv_release_all_locks(store);
+        else kv_release_bucket_lock(store, key);
         return KV_ERR_INTERNAL;
     }
 
@@ -154,7 +182,11 @@ int kv_lpush(kv_store_t *store, const char *key, const char *value) {
     append_aof_rewrite_buffer(store, "\n", 1);
 
     int count = (int)list->count;
-    pthread_mutex_unlock(&store->lock);
+    if (needs_global) {
+        kv_release_all_locks(store);
+    } else {
+        kv_release_bucket_lock(store, key);
+    }
     return count;
 }
 
@@ -163,21 +195,21 @@ int kv_rpop(kv_store_t *store, const char *key, char **out_value) {
         return KV_ERR_INVALID_PARAM;
     }
 
-    pthread_mutex_lock(&store->lock);
+    kv_acquire_bucket_lock(store, key);
 
     kv_entry_t *entry = find_entry_unlocked(store, key);
     if (entry == NULL) {
-        pthread_mutex_unlock(&store->lock);
+        kv_release_bucket_lock(store, key);
         return KV_ERR_NOT_FOUND;
     }
     if (entry->type != KV_TYPE_LIST) {
-        pthread_mutex_unlock(&store->lock);
+        kv_release_bucket_lock(store, key);
         return KV_ERR_WRONG_TYPE;
     }
 
     kv_list_t *list = (kv_list_t *)entry->value_ptr;
     if (list == NULL || list->tail == NULL || list->count == 0U) {
-        pthread_mutex_unlock(&store->lock);
+        kv_release_bucket_lock(store, key);
         return KV_ERR_NOT_FOUND;
     }
 
@@ -185,7 +217,7 @@ int kv_rpop(kv_store_t *store, const char *key, char **out_value) {
     size_t vlen = strlen(node->value);
     char *ret = malloc(vlen + 1U);
     if (ret == NULL) {
-        pthread_mutex_unlock(&store->lock);
+        kv_release_bucket_lock(store, key);
         return KV_ERR_INTERNAL;
     }
     memcpy(ret, node->value, vlen);
@@ -224,7 +256,7 @@ int kv_rpop(kv_store_t *store, const char *key, char **out_value) {
         entry->last_accessed_time = ++store->lru_clock;
     }
 
-    pthread_mutex_unlock(&store->lock);
+    kv_release_bucket_lock(store, key);
     return KV_OK;
 }
 
@@ -233,15 +265,15 @@ int kv_llen(kv_store_t *store, const char *key) {
         return KV_ERR_INVALID_PARAM;
     }
 
-    pthread_mutex_lock(&store->lock);
+    kv_acquire_bucket_lock(store, key);
 
     kv_entry_t *entry = find_entry_unlocked(store, key);
     if (entry == NULL) {
-        pthread_mutex_unlock(&store->lock);
+        kv_release_bucket_lock(store, key);
         return 0;
     }
     if (entry->type != KV_TYPE_LIST) {
-        pthread_mutex_unlock(&store->lock);
+        kv_release_bucket_lock(store, key);
         return KV_ERR_WRONG_TYPE;
     }
 
@@ -249,6 +281,6 @@ int kv_llen(kv_store_t *store, const char *key) {
     int count = (list != NULL) ? (int)list->count : 0;
     entry->last_accessed_time = ++store->lru_clock;
 
-    pthread_mutex_unlock(&store->lock);
+    kv_release_bucket_lock(store, key);
     return count;
 }

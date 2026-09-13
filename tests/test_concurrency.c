@@ -384,10 +384,8 @@ static void test_concurrent_budget_enforcement(void) {
         ASSERT_EQ_INT(pthread_create(&threads[i], NULL, thread_budget_runner, &args[i]), 0);
     }
 
-    int total_budget_hits = 0;
     for (int i = 0; i < NUM_THREADS; ++i) {
         ASSERT_EQ_INT(pthread_join(threads[i], NULL), 0);
-        total_budget_hits += args[i].budget_hits;
     }
 
     /* Threads must have successfully evicted keys and remained under budget */
@@ -478,6 +476,7 @@ static void test_concurrent_aof_persistence(void) {
 }
 
 int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);
     printf("==================================================\n");
     printf("  Mini Key-Value Database Server — Concurrency    \n");
     printf("==================================================\n");
